@@ -1,0 +1,148 @@
+# Перевірка кешуючого проксі-сервера за допомогою curl
+# Запуск сервера:  node main.js -h 127.0.0.1 -p 3000 -c ./cache
+# (у PowerShell замість curl пишіть curl.exe, бо curl там — псевдонім Invoke-WebRequest)
+# -i  показати заголовки відповіді;  -D -  вивести лише заголовки;  -o file  зберегти тіло у файл;  -X  метод;
+# --data-binary @file  надіслати файл у тілі БЕЗ змін (на відміну від -d, який прибирає \n)
+
+############ 0. Запуск без обов'язкових опцій ############
+$ node main.js; echo exit code: $?
+error: required option '-h, --host <address>' not specified
+exit code: 1
+
+$ node main.js -h 127.0.0.1 -p 3000; echo exit code: $?
+error: required option '-c, --cache <path>' not specified
+exit code: 1
+
+$ node main.js -h 127.0.0.1 -p abc -c ./cache; echo exit code: $?
+error: option '-p, --port <number>' argument 'abc' is invalid. порт має бути цілим числом від 0 до 65535
+exit code: 1
+
+############ 1. GET ############
+# 1.1 Картинки ще немає в кеші -> береться з http.cat (X-Image-Source: http.cat)
+$ curl -s -o /dev/null -D - http://127.0.0.1:3000/200
+HTTP/1.1 200 OK
+Content-Type: image/jpeg
+Content-Length: 31128
+X-Image-Source: http.cat
+
+
+# 1.2 Повторний запит -> з кешу (X-Image-Source: cache)
+$ curl -s -o /dev/null -D - http://127.0.0.1:3000/200
+HTTP/1.1 200 OK
+Content-Type: image/jpeg
+Content-Length: 31128
+X-Image-Source: cache
+
+
+# 1.3 Зберегти картинку у файл і порівняти з оригіналом http.cat (cmp нічого не виводить = файли однакові)
+$ curl -s -o got-200.jpg http://127.0.0.1:3000/200 && curl -s -o orig-200.jpg https://http.cat/200 && cmp got-200.jpg orig-200.jpg && echo однакові
+однакові
+
+# 1.4 Неіснуючий код -> 404, у кеш нічого не пишеться
+$ curl -s -i http://127.0.0.1:3000/999
+HTTP/1.1 404 Not Found
+Content-Type: text/plain; charset=utf-8
+Content-Length: 128
+
+Картинку для коду 999 не знайдено ні в кеші, ні на http.cat (http.cat відповів 404)
+
+$ ls cache
+200.jpg
+
+# 1.5 Неправильний шлях -> 400
+$ curl -s -i http://127.0.0.1:3000/abc
+HTTP/1.1 400 Bad Request
+Content-Type: text/plain; charset=utf-8
+Content-Length: 123
+
+Неправильний шлях "/abc". Очікується /<код стану з 3 цифр>, наприклад /404
+
+$ curl -s -i --path-as-is http://127.0.0.1:3000/../main.js
+HTTP/1.1 400 Bad Request
+Content-Type: text/plain; charset=utf-8
+Content-Length: 127
+
+Неправильний шлях "/main.js". Очікується /<код стану з 3 цифр>, наприклад /404
+
+# 1.6 Час відповіді: перший запит (http.cat) і повторний (кеш)
+$ curl -s -o /dev/null -w 'перший: %{time_total} c\n' http://127.0.0.1:3000/451
+first: 0.233777 s
+
+$ curl -s -o /dev/null -w 'повторний: %{time_total} c\n' http://127.0.0.1:3000/451
+second: 0.001917 s
+
+############ 2. PUT ############
+# 2.1 Записати власну картинку (нову)
+$ curl -s -i -X PUT --data-binary @test-images/my-cat.jpg http://127.0.0.1:3000/299
+HTTP/1.1 201 Created
+Content-Type: text/plain; charset=utf-8
+Content-Length: 82
+
+Картинку для коду 299 збережено в кеш (9124 байт)
+
+# 2.2 Замінити наявну картинку 200 своєю
+$ curl -s -i -X PUT --data-binary @test-images/my-cat.jpg http://127.0.0.1:3000/200
+HTTP/1.1 201 Created
+Content-Type: text/plain; charset=utf-8
+Content-Length: 82
+
+Картинку для коду 200 збережено в кеш (9124 байт)
+
+# 2.3 GET після PUT повертає мою картинку, а не з http.cat
+$ curl -s -o got.jpg -D - http://127.0.0.1:3000/200 && cmp got.jpg test-images/my-cat.jpg && echo це моя картинка
+HTTP/1.1 200 OK
+Content-Type: image/jpeg
+Content-Length: 9124
+X-Image-Source: cache
+
+це моя картинка
+
+# 2.4 PUT без тіла -> 400
+$ curl -s -i -X PUT http://127.0.0.1:3000/201
+HTTP/1.1 400 Bad Request
+Content-Type: text/plain; charset=utf-8
+Content-Length: 103
+
+Тіло запиту порожнє: передайте картинку в тілі PUT-запиту
+
+############ 3. DELETE ############
+$ curl -s -i -X DELETE http://127.0.0.1:3000/200
+HTTP/1.1 200 OK
+Content-Type: text/plain; charset=utf-8
+Content-Length: 66
+
+Картинку для коду 200 видалено з кешу
+
+# 3.1 Повторне видалення -> 404
+$ curl -s -i -X DELETE http://127.0.0.1:3000/200
+HTTP/1.1 404 Not Found
+Content-Type: text/plain; charset=utf-8
+Content-Length: 60
+
+Картинки для коду 200 немає в кеші
+
+# 3.2 Після видалення GET знову йде на http.cat
+$ curl -s -o /dev/null -D - http://127.0.0.1:3000/200
+HTTP/1.1 200 OK
+Content-Type: image/jpeg
+Content-Length: 31128
+X-Image-Source: http.cat
+
+
+############ 4. Інші методи -> 405 + заголовок Allow ############
+$ curl -s -i -X POST http://127.0.0.1:3000/200
+HTTP/1.1 405 Method Not Allowed
+Content-Type: text/plain; charset=utf-8
+Content-Length: 86
+Allow: GET, PUT, DELETE
+
+Метод POST не підтримується. Дозволені: GET, PUT, DELETE
+
+$ curl -s -i -X PATCH http://127.0.0.1:3000/200
+HTTP/1.1 405 Method Not Allowed
+Content-Type: text/plain; charset=utf-8
+Content-Length: 87
+Allow: GET, PUT, DELETE
+
+Метод PATCH не підтримується. Дозволені: GET, PUT, DELETE
+
