@@ -100,8 +100,13 @@ async function handleRequest(req, res) {
       case 'PUT':
         await handlePut(req, code, file, res);
         break;
+      case 'DELETE':
+        await handleDelete(code, file, res);
+        break;
       default:
-        throw new HttpError(405, `Метод ${req.method} ще не реалізовано`);
+        // сюди не потрапимо, бо метод уже перевірено вище; гілка — на випадок
+        // якщо хтось додасть метод в ALLOWED_METHODS, але забуде обробник
+        throw new HttpError(405, `Метод ${req.method} не реалізовано`);
     }
   } catch (err) {
     sendError(res, err);
@@ -144,6 +149,20 @@ async function handlePut(req, code, file, res) {
   }
   await fs.writeFile(file, body); // байти записуються без змін
   sendText(res, 201, `Картинку для коду ${code} збережено в кеш (${body.length} байт)
+`);
+}
+
+/** DELETE: видалити картинку з кешу. */
+async function handleDelete(code, file, res) {
+  try {
+    await fs.unlink(file);
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      throw new HttpError(404, `Картинки для коду ${code} немає в кеші`);
+    }
+    throw err; // EPERM, EBUSY тощо -> 500
+  }
+  sendText(res, 200, `Картинку для коду ${code} видалено з кешу
 `);
 }
 
