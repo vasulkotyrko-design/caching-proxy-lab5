@@ -153,8 +153,7 @@ async function handlePut(req, code, file, res) {
     throw new HttpError(400, 'Тіло запиту порожнє: передайте картинку в тілі PUT-запиту');
   }
   await writeFileAtomic(file, body); // байти записуються без змін
-  sendText(res, 201, `Картинку для коду ${code} збережено в кеш (${body.length} байт)
-`);
+  sendText(res, 201, `Картинку для коду ${code} збережено в кеш (${body.length} байт)\n`);
 }
 
 /** DELETE: видалити картинку з кешу. */
@@ -167,8 +166,7 @@ async function handleDelete(code, file, res) {
     }
     throw err; // EPERM, EBUSY тощо -> 500
   }
-  sendText(res, 200, `Картинку для коду ${code} видалено з кешу
-`);
+  sendText(res, 200, `Картинку для коду ${code} видалено з кешу\n`);
 }
 
 // ---------------------------------------------------------------------------
