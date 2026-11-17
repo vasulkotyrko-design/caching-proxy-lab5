@@ -4,6 +4,7 @@ const http = require('node:http');
 const path = require('node:path');
 const fs = require('node:fs/promises');
 const { once } = require('node:events');
+const { randomUUID } = require('node:crypto');
 const { Command, InvalidArgumentError } = require('commander');
 const superagent = require('superagent');
 
@@ -18,6 +19,11 @@ const UPSTREAM_TIMEOUT = { response: 5000, deadline: 15000 };
 const SOURCE_HEADER = 'X-Image-Source';
 // Максимальний розмір тіла PUT-запиту (захист від заповнення пам'яті й диска)
 const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10 МБ
+
+// Запити до http.cat, які зараз виконуються: код -> проміс з картинкою.
+// Якщо кілька клієнтів одночасно просять ту саму відсутню в кеші картинку,
+// до http.cat піде лише ОДИН запит, а решта дочекаються того самого проміса.
+const inFlight = new Map();
 
 /** Помилка, яка вже "знає" свій код стану HTTP. */
 class HttpError extends Error {
@@ -128,8 +134,7 @@ async function handleGet(code, file, res) {
     source = 'cache';
   } catch (err) {
     if (err.code !== 'ENOENT') throw err; // інша помилка диска -> 500
-    image = await fetchFromUpstream(code); // помилка -> HttpError 404, у кеш нічого не пишемо
-    await fs.writeFile(file, image); // 1) спочатку зберігаємо в кеш
+    image = await fetchAndCache(code, file); // 1) спочатку зберігаємо в кеш
     source = 'http.cat';
   }
   // 2) потім віддаємо клієнтові
@@ -147,7 +152,7 @@ async function handlePut(req, code, file, res) {
   if (body.length === 0) {
     throw new HttpError(400, 'Тіло запиту порожнє: передайте картинку в тілі PUT-запиту');
   }
-  await fs.writeFile(file, body); // байти записуються без змін
+  await writeFileAtomic(file, body); // байти записуються без змін
   sendText(res, 201, `Картинку для коду ${code} збережено в кеш (${body.length} байт)
 `);
 }
@@ -170,9 +175,30 @@ async function handleDelete(code, file, res) {
 // 5. Запит до http.cat
 // ---------------------------------------------------------------------------
 
+/** Повертає проміс картинки; паралельні запити того самого коду ділять один проміс. */
+function fetchAndCache(code, file) {
+  let promise = inFlight.get(code);
+  if (!promise) {
+    promise = downloadToCache(code, file);
+    inFlight.set(code, promise);
+  }
+  return promise;
+}
+
+async function downloadToCache(code, file) {
+  try {
+    const image = await fetchFromUpstream(code); // помилка -> HttpError 404, у кеш нічого не пишемо
+    await writeFileAtomic(file, image);
+    return image;
+  } finally {
+    inFlight.delete(code);
+  }
+}
+
 /** Повертає Buffer з картинкою або кидає HttpError(404). */
 async function fetchFromUpstream(code) {
   const url = `${UPSTREAM_URL}/${code}`;
+  console.log(`  -> запит до ${url}`);
   let response;
   try {
     response = await superagent.get(url).timeout(UPSTREAM_TIMEOUT);
@@ -233,6 +259,23 @@ async function readBody(req, limit) {
     chunks.push(chunk);
   }
   return Buffer.concat(chunks, size);
+}
+
+/**
+ * Атомарний запис: спочатку пишемо в тимчасовий файл з унікальним ім'ям,
+ * потім перейменовуємо його на остаточне. rename у межах однієї теки атомарний,
+ * тому інший запит ніколи не прочитає наполовину записаний файл, а при збої
+ * (помилка диска, падіння процесу) у кеші не з'явиться пошкоджена картинка.
+ */
+async function writeFileAtomic(file, data) {
+  const tmp = `${file}.${randomUUID()}.tmp`;
+  try {
+    await fs.writeFile(tmp, data);
+    await fs.rename(tmp, file);
+  } catch (err) {
+    await fs.rm(tmp, { force: true }); // прибираємо "сміття"
+    throw err;
+  }
 }
 
 /** Шлях до файлу кешу: <тека кешу>/<код>.jpg */
