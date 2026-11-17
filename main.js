@@ -16,6 +16,8 @@ const UPSTREAM_URL = 'https://http.cat';
 const UPSTREAM_TIMEOUT = { response: 5000, deadline: 15000 };
 // Заголовок, з якого видно, звідки взято картинку
 const SOURCE_HEADER = 'X-Image-Source';
+// Максимальний розмір тіла PUT-запиту (захист від заповнення пам'яті й диска)
+const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10 МБ
 
 /** Помилка, яка вже "знає" свій код стану HTTP. */
 class HttpError extends Error {
@@ -95,6 +97,9 @@ async function handleRequest(req, res) {
       case 'GET':
         await handleGet(code, file, res);
         break;
+      case 'PUT':
+        await handlePut(req, code, file, res);
+        break;
       default:
         throw new HttpError(405, `Метод ${req.method} ще не реалізовано`);
     }
@@ -129,6 +134,17 @@ async function handleGet(code, file, res) {
     [SOURCE_HEADER]: source,
   });
   res.end(image);
+}
+
+/** PUT: записати картинку з тіла запиту в кеш (або замінити наявну). */
+async function handlePut(req, code, file, res) {
+  const body = await readBody(req, MAX_BODY_SIZE);
+  if (body.length === 0) {
+    throw new HttpError(400, 'Тіло запиту порожнє: передайте картинку в тілі PUT-запиту');
+  }
+  await fs.writeFile(file, body); // байти записуються без змін
+  sendText(res, 201, `Картинку для коду ${code} збережено в кеш (${body.length} байт)
+`);
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +192,28 @@ function parseStatusCode(url) {
     throw new HttpError(400, `Неправильний шлях "${pathname}". Очікується /<код стану з 3 цифр>, наприклад /404`);
   }
   return match[1];
+}
+
+/**
+ * Читає все тіло запиту в один Buffer.
+ * req — це потік (Readable), а потоки підтримують асинхронну ітерацію:
+ * for await ... of отримує шматки (chunk) по мірі надходження, без колбеків.
+ */
+async function readBody(req, limit) {
+  const declared = Number(req.headers['content-length']);
+  if (declared > limit) {
+    throw new HttpError(413, `Тіло запиту завелике: ${declared} байт, максимум ${limit}`);
+  }
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > limit) {
+      throw new HttpError(413, `Тіло запиту завелике: більше ніж ${limit} байт`);
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks, size);
 }
 
 /** Шлях до файлу кешу: <тека кешу>/<код>.jpg */
