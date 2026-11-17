@@ -5,11 +5,17 @@ const path = require('node:path');
 const fs = require('node:fs/promises');
 const { once } = require('node:events');
 const { Command, InvalidArgumentError } = require('commander');
+const superagent = require('superagent');
 
 // ---------------------------------------------------------------------------
 // Константи
 // ---------------------------------------------------------------------------
 const ALLOWED_METHODS = ['GET', 'PUT', 'DELETE'];
+const UPSTREAM_URL = 'https://http.cat';
+// response — скільки чекати на перший байт відповіді, deadline — на всю відповідь
+const UPSTREAM_TIMEOUT = { response: 5000, deadline: 15000 };
+// Заголовок, з якого видно, звідки взято картинку
+const SOURCE_HEADER = 'X-Image-Source';
 
 /** Помилка, яка вже "знає" свій код стану HTTP. */
 class HttpError extends Error {
@@ -86,6 +92,9 @@ async function handleRequest(req, res) {
     const file = cacheFilePath(code);
 
     switch (req.method) {
+      case 'GET':
+        await handleGet(code, file, res);
+        break;
       default:
         throw new HttpError(405, `Метод ${req.method} ще не реалізовано`);
     }
@@ -97,7 +106,62 @@ async function handleRequest(req, res) {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Допоміжні функції
+// 4. Обробники методів
+// ---------------------------------------------------------------------------
+
+/** GET: віддати картинку з кешу, а якщо її немає — взяти з http.cat і закешувати. */
+async function handleGet(code, file, res) {
+  let image;
+  let source;
+  try {
+    image = await fs.readFile(file);
+    source = 'cache';
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err; // інша помилка диска -> 500
+    image = await fetchFromUpstream(code); // помилка -> HttpError 404, у кеш нічого не пишемо
+    await fs.writeFile(file, image); // 1) спочатку зберігаємо в кеш
+    source = 'http.cat';
+  }
+  // 2) потім віддаємо клієнтові
+  res.writeHead(200, {
+    'Content-Type': 'image/jpeg',
+    'Content-Length': image.length,
+    [SOURCE_HEADER]: source,
+  });
+  res.end(image);
+}
+
+// ---------------------------------------------------------------------------
+// 5. Запит до http.cat
+// ---------------------------------------------------------------------------
+
+/** Повертає Buffer з картинкою або кидає HttpError(404). */
+async function fetchFromUpstream(code) {
+  const url = `${UPSTREAM_URL}/${code}`;
+  let response;
+  try {
+    response = await superagent.get(url).timeout(UPSTREAM_TIMEOUT);
+  } catch (err) {
+    if (err.status) {
+      // сервер відповів кодом 4xx/5xx — картинки для такого коду немає
+      throw new HttpError(404, `Картинку для коду ${code} не знайдено ні в кеші, ні на http.cat (http.cat відповів ${err.status})`);
+    }
+    if (err.timeout) {
+      throw new HttpError(404, `Картинку для коду ${code} не отримано: http.cat не відповів вчасно`);
+    }
+    // помилка мережі: ENOTFOUND, ECONNREFUSED, ECONNRESET ...
+    throw new HttpError(404, `Картинку для коду ${code} не отримано: помилка з'єднання з http.cat (${err.code || err.message})`);
+  }
+
+  // superagent у Node.js для image/* сам збирає тіло в Buffer (response.body)
+  if (!Buffer.isBuffer(response.body) || response.body.length === 0) {
+    throw new HttpError(404, `http.cat повернув для коду ${code} не картинку (${response.type})`);
+  }
+  return response.body;
+}
+
+// ---------------------------------------------------------------------------
+// 6. Допоміжні функції
 // ---------------------------------------------------------------------------
 
 /**
